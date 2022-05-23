@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import copy, deepcopy
 from dataclasses import dataclass, field, fields
+from heapq import merge
 from typing import Dict, List, Optional, Set, Union
 
 from pycardano.address import Address
@@ -295,7 +296,9 @@ class TransactionBuilder:
         # when there is only ADA left, simply use remaining coin value as change
         if not change.multi_asset:
             if change.coin < min_lovelace(change, self.context):
-                raise InsufficientUTxOBalanceException("Not enough ADA left for change")
+                raise InsufficientUTxOBalanceException(
+                    f"Not enough ADA left for change: {change.coin} but needs {min_lovelace(change, self.context)}"
+                )
             lovelace_change = change.coin
             change_output_arr.append(TransactionOutput(address, lovelace_change))
 
@@ -330,17 +333,34 @@ class TransactionBuilder:
         return change_output_arr
 
     def _add_change_and_fee(
-        self, change_address: Optional[Address]
+        self, change_address: Optional[Address], merge_change: Optional[bool] = False,
     ) -> TransactionBuilder:
         original_outputs = self.outputs[:]
 
         if change_address:
+
+            change_output_indices = []
+
+            if merge_change:
+                
+                for idx, output in enumerate(original_outputs):
+
+                    # Find any transaction outputs which already contain the change address
+                    if change_address == output.address:
+                        change_output_indices.append(idx)
+
+                    # if any output is empty, set to 1 ADA for fee calculation
+                    if output.lovelace == 0:
+                        self._outputs[idx] = copy(output, dummy_amount=1000000)
+
             # Set fee to max
             self.fee = self._estimate_fee()
             changes = self._calc_change(
                 self.fee, self.inputs, self.outputs, change_address, precise_fee=True
             )
-            self._outputs += changes
+
+            if not change_output_indices or len(changes) > 1:
+                self._outputs += changes
 
         # With changes included, we can estimate the fee more precisely
         self.fee = self._estimate_fee()
@@ -350,7 +370,16 @@ class TransactionBuilder:
             changes = self._calc_change(
                 self.fee, self.inputs, self.outputs, change_address, precise_fee=True
             )
-            self._outputs += changes
+
+            if change_output_indices and len(changes) == 1:
+                # Add the leftover change to the TransactionOutput containing the change address
+                self._outputs[change_output_indices[-1]].amount = (
+                    changes[0].amount + self._outputs[change_output_indices[-1]].amount
+                )
+                # if we enforce that TransactionOutputs must use Values for `amount`, we can use += here
+
+            else:
+                self._outputs += changes
 
         return self
 
@@ -592,7 +621,7 @@ class TransactionBuilder:
 
         return estimated_fee
 
-    def build(self, change_address: Optional[Address] = None) -> TransactionBody:
+    def build(self, change_address: Optional[Address] = None, merge_change: Optional[bool] = False) -> TransactionBody:
         """Build a transaction body from all constraints set through the builder.
 
         Args:
